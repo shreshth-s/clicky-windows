@@ -24,7 +24,7 @@ public enum CompanionVoiceState
 /// </summary>
 public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
 {
-    public const string WorkerBaseUrl = "https://your-worker-name.your-subdomain.workers.dev";
+    public const string WorkerBaseUrl = "https://clicky-proxy.shreshthsharma1904.workers.dev";
 
     private const string SystemPrompt =
         "You are Clicky, a friendly AI learning companion that lives next to the user's cursor on Windows. " +
@@ -33,7 +33,11 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
         "When you want to point at a specific UI element in the screenshots, embed a tag like: " +
         "[POINT:x,y:description:Screen 1 (Primary)] where x,y are pixel coordinates in that screenshot " +
         "and the screen name matches the label shown with each image. " +
-        "Only include one POINT tag per response. Keep responses under 3 sentences when possible.";
+        "When the user explicitly asks you to click something, you can actually perform the click using: " +
+        "[CLICK:x,y:description:Screen 1 (Primary)] — this will move the user's cursor and left-click. " +
+        "Never CLICK destructive actions (close, delete, send, submit, purchase, sign out) unless the user " +
+        "names that exact action. When unsure, prefer POINT over CLICK and ask for confirmation. " +
+        "Only include one POINT or CLICK tag per response. Keep responses under 3 sentences when possible.";
 
     private CompanionVoiceState _voiceState = CompanionVoiceState.Idle;
     public CompanionVoiceState VoiceState
@@ -93,6 +97,7 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
 
     public event Action<bool>? CursorEnabledChanged;
     public event Action<PointingTarget>? PointingTargetDetected;
+    public event Action<ClickTarget>? ClickTargetDetected;
 
     private readonly GlobalHotkeyMonitor _globalHotkeyMonitor;
     private readonly AudioCaptureService _audioCaptureService;
@@ -108,6 +113,11 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
 
     private static readonly Regex PointTagRegex = new(
         @"\[POINT:(\d+(?:\.\d+)?)[:,](\d+(?:\.\d+)?):(?:([^:\]]+):)?([^\]]+)\]",
+        RegexOptions.Compiled
+    );
+
+    private static readonly Regex ClickTagRegex = new(
+        @"\[CLICK:(\d+(?:\.\d+)?)[:,](\d+(?:\.\d+)?):(?:([^:\]]+):)?([^\]]+)\]",
         RegexOptions.Compiled
     );
 
@@ -205,7 +215,7 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
         {
             var capturedScreens = await Task.Run(ScreenCaptureUtility.CaptureAllScreens);
             var screenshots = capturedScreens
-                .Select(s => (s.JpegData, s.Label))
+                .Select(s => (s.JpegData, s.Label, s.Bounds.Width, s.Bounds.Height))
                 .ToList();
 
             VoiceState = CompanionVoiceState.Responding;
@@ -232,6 +242,14 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
             {
                 await _uiDispatcher.InvokeAsync(() =>
                     PointingTargetDetected?.Invoke(pointingTarget)
+                );
+            }
+
+            var clickTarget = ParseClickTarget(fullResponse, capturedScreens);
+            if (clickTarget != null)
+            {
+                await _uiDispatcher.InvokeAsync(() =>
+                    ClickTargetDetected?.Invoke(clickTarget)
                 );
             }
 
@@ -277,6 +295,15 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
             s.Label.Equals(screenName, StringComparison.OrdinalIgnoreCase)
         );
 
+        // If Claude dropped the screen name and there's only one screen,
+        // re-interpret group 4 as the description and use the single screen.
+        if (targetScreen == null && capturedScreens.Count == 1)
+        {
+            targetScreen = capturedScreens[0];
+            description = screenName;
+            screenName = targetScreen.Label;
+        }
+
         if (targetScreen == null)
         {
             Console.WriteLine(
@@ -296,9 +323,55 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
         return new PointingTarget(actualScreenX, actualScreenY, description, screenName);
     }
 
+    private ClickTarget? ParseClickTarget(
+        string claudeResponse,
+        IReadOnlyList<ScreenCaptureUtility.CapturedScreen> capturedScreens
+    )
+    {
+        var match = ClickTagRegex.Match(claudeResponse);
+        if (!match.Success) return null;
+
+        if (!double.TryParse(match.Groups[1].Value, out double screenshotX)) return null;
+        if (!double.TryParse(match.Groups[2].Value, out double screenshotY)) return null;
+
+        string screenName = match.Groups[4].Value.Trim();
+        string description = match.Groups[3].Success && match.Groups[3].Value.Trim().Length > 0
+            ? match.Groups[3].Value.Trim()
+            : screenName;
+
+        var targetScreen = capturedScreens.FirstOrDefault(s =>
+            s.Label.Equals(screenName, StringComparison.OrdinalIgnoreCase)
+        );
+
+        if (targetScreen == null && capturedScreens.Count == 1)
+        {
+            targetScreen = capturedScreens[0];
+            description = screenName;
+            screenName = targetScreen.Label;
+        }
+
+        if (targetScreen == null)
+        {
+            Console.WriteLine($"⚠️ CLICK tag references unknown screen '{screenName}'");
+            return null;
+        }
+
+        double actualScreenX = targetScreen.Bounds.X + screenshotX;
+        double actualScreenY = targetScreen.Bounds.Y + screenshotY;
+
+        Console.WriteLine(
+            $"🖱️ CLICK: ({screenshotX}, {screenshotY}) on '{screenName}' → " +
+            $"screen coords ({actualScreenX}, {actualScreenY}) — \"{description}\""
+        );
+
+        return new ClickTarget(actualScreenX, actualScreenY, description, screenName);
+    }
+
     private static string StripPointTagsForDisplay(string text)
     {
-        return PointTagRegex.Replace(text, "").Trim();
+        text = PointTagRegex.Replace(text, "");
+        text = ClickTagRegex.Replace(text, "");
+        return text.Trim();
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -322,6 +395,13 @@ public sealed class CompanionManager : INotifyPropertyChanged, IDisposable
 }
 
 public record PointingTarget(
+    double ScreenX,
+    double ScreenY,
+    string Description,
+    string ScreenName
+);
+
+public record ClickTarget(
     double ScreenX,
     double ScreenY,
     string Description,

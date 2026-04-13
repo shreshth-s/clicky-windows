@@ -4,6 +4,7 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
+using ClickyWindows.Services;
 
 namespace ClickyWindows;
 
@@ -31,6 +32,12 @@ public partial class OverlayWindow : Window
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    private static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
+
+    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    private const uint MOUSEEVENTF_LEFTUP = 0x0004;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
@@ -78,6 +85,7 @@ public partial class OverlayWindow : Window
         _companionManager = companionManager;
         companionManager.PropertyChanged += OnCompanionManagerPropertyChanged;
         companionManager.PointingTargetDetected += OnPointingTargetDetected;
+        companionManager.ClickTargetDetected += OnClickTargetDetected;
     }
 
     private void OnCursorFollowTick(object? sender, EventArgs e)
@@ -237,8 +245,76 @@ public partial class OverlayWindow : Window
 
     private void OnPointingTargetDetected(PointingTarget target)
     {
-        double targetCanvasX = target.ScreenX - SystemParameters.VirtualScreenLeft - 30;
-        double targetCanvasY = target.ScreenY - SystemParameters.VirtualScreenTop - 30;
+        var resolved = ResolveTargetToPhysical(target.ScreenX, target.ScreenY, target.Description);
+        var dips = PhysicalToDips(resolved.PhysicalX, resolved.PhysicalY);
+        FlyCursorTo(dips.X, dips.Y, target.Description);
+    }
+
+    private void OnClickTargetDetected(ClickTarget target)
+    {
+        var resolved = ResolveTargetToPhysical(target.ScreenX, target.ScreenY, target.Description);
+        var dips = PhysicalToDips(resolved.PhysicalX, resolved.PhysicalY);
+
+        FlyCursorTo(dips.X, dips.Y, "Clicking " + target.Description, onArrive: () =>
+        {
+            SetCursorPos((int)resolved.PhysicalX, (int)resolved.PhysicalY);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+            Console.WriteLine(
+                $"🖱️ Clicked at physical ({resolved.PhysicalX:F0}, {resolved.PhysicalY:F0})" +
+                (resolved.SnappedName != null ? $" — snapped to \"{resolved.SnappedName}\"" : " — raw")
+            );
+        });
+    }
+
+    private (double PhysicalX, double PhysicalY, string? SnappedName) ResolveTargetToPhysical(
+        double dipsX,
+        double dipsY,
+        string targetDescription
+    )
+    {
+        // Claude empirically returns coordinates in a DIPs-ish space even when
+        // instructed otherwise, so convert to physical pixels before UI
+        // Automation and SetCursorPos see them.
+        var physical = DipsToPhysical(dipsX, dipsY);
+
+        var snap = UiAutomationSnapper.TrySnapNearby(
+            physical.X,
+            physical.Y,
+            searchRadiusPhysical: 120,
+            targetDescription: targetDescription
+        );
+        if (snap == null)
+        {
+            Console.WriteLine(
+                $"🎯 No interactable near physical ({physical.X:F0}, {physical.Y:F0}) — using raw"
+            );
+            return (physical.X, physical.Y, null);
+        }
+
+        Console.WriteLine(
+            $"🎯 Snap: raw physical ({physical.X:F0}, {physical.Y:F0}) → " +
+            $"({snap.Value.X:F0}, {snap.Value.Y:F0}) on {snap.Value.ControlType} \"{snap.Value.ElementName}\""
+        );
+        return (snap.Value.X, snap.Value.Y, snap.Value.ElementName);
+    }
+
+    private System.Windows.Point DipsToPhysical(double dipsX, double dipsY)
+    {
+        var transform = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice ?? Matrix.Identity;
+        return transform.Transform(new System.Windows.Point(dipsX, dipsY));
+    }
+
+    private System.Windows.Point PhysicalToDips(double physicalX, double physicalY)
+    {
+        var transform = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformFromDevice ?? Matrix.Identity;
+        return transform.Transform(new System.Windows.Point(physicalX, physicalY));
+    }
+
+    private void FlyCursorTo(double screenX, double screenY, string bubbleText, Action? onArrive = null)
+    {
+        double targetCanvasX = screenX - SystemParameters.VirtualScreenLeft - 30;
+        double targetCanvasY = screenY - SystemParameters.VirtualScreenTop - 30;
 
         var flyDuration = TimeSpan.FromMilliseconds(600);
         var easingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut };
@@ -259,7 +335,8 @@ public partial class OverlayWindow : Window
 
         flyXAnimation.Completed += (_, _) =>
         {
-            ShowPointingBubble(target.Description, targetCanvasX + 70, targetCanvasY - 10);
+            ShowPointingBubble(bubbleText, targetCanvasX + 70, targetCanvasY - 10);
+            onArrive?.Invoke();
         };
 
         CursorCanvas.BeginAnimation(System.Windows.Controls.Canvas.LeftProperty, flyXAnimation);
@@ -273,6 +350,15 @@ public partial class OverlayWindow : Window
             settleTimer.Stop();
             GetCursorPos(out POINT curPos);
             _cursorPosAtPointEnd = curPos;
+
+            // Sync internal follow state + local Canvas value to the target
+            // before clearing the animation, otherwise WPF reverts to the
+            // pre-fly local value and the buddy snaps back.
+            _buddyPositionX = targetCanvasX + 30;
+            _buddyPositionY = targetCanvasY + 30;
+            System.Windows.Controls.Canvas.SetLeft(CursorCanvas, targetCanvasX);
+            System.Windows.Controls.Canvas.SetTop(CursorCanvas, targetCanvasY);
+
             CursorCanvas.BeginAnimation(System.Windows.Controls.Canvas.LeftProperty, null);
             CursorCanvas.BeginAnimation(System.Windows.Controls.Canvas.TopProperty, null);
             _cursorFollowTimer.Start();

@@ -25,7 +25,7 @@ public sealed class ClaudeApiClient
     }
 
     public async Task<string> AnalyzeScreensAndAskAsync(
-        IReadOnlyList<(byte[] JpegData, string Label)> screenshots,
+        IReadOnlyList<(byte[] JpegData, string Label, int Width, int Height)> screenshots,
         string systemPrompt,
         IReadOnlyList<(string UserMessage, string AssistantResponse)> conversationHistory,
         string userPrompt,
@@ -91,7 +91,7 @@ public sealed class ClaudeApiClient
     }
 
     private object BuildRequestBody(
-        IReadOnlyList<(byte[] JpegData, string Label)> screenshots,
+        IReadOnlyList<(byte[] JpegData, string Label, int Width, int Height)> screenshots,
         string systemPrompt,
         IReadOnlyList<(string UserMessage, string AssistantResponse)> conversationHistory,
         string userPrompt
@@ -107,7 +107,7 @@ public sealed class ClaudeApiClient
 
         var contentBlocks = new List<object>();
 
-        foreach (var (jpegData, label) in screenshots)
+        foreach (var (jpegData, label, _, _) in screenshots)
         {
             contentBlocks.Add(new
             {
